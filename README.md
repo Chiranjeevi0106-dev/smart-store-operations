@@ -9,7 +9,7 @@ Enterprise-grade retail technology platform for a mid-size grocery chain (8 stor
 
 Dashboard (Frontend)
 
-https://YOUR-VERCEL-URL.vercel.app
+https://smart-store-operations.vercel.app
 
 API Documentation
 
