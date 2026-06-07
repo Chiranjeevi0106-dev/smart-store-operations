@@ -5,6 +5,35 @@
 Enterprise-grade retail technology platform for a mid-size grocery chain (8 stores, ~3,500 sq ft each). Uses IoT shelf sensors, RFID, and overhead cameras to automate shelf monitoring, queue management, and loss prevention.
 
 ---
+## Live Deployment
+
+Dashboard (Frontend)
+
+https://YOUR-VERCEL-URL.vercel.app
+
+API Documentation
+
+https://smart-store-api-bzz2.onrender.com/docs
+
+Backend API
+
+https://smart-store-api-bzz2.onrender.com
+
+
+## Screenshots
+
+### api-docs
+![api-docs](docs/screenshots/api-docs.png)
+
+### dashboard
+![dashboard](docs/screenshots/dashboard.png)
+
+### queue-monitoring
+![queue-monitoring](docs/screenshots/queue-monitoring.png)
+
+### shelf-monitoring
+![shelf-monitoring](docs/screenshots/shelf-monitoring.png)
+
 
 ## 🏗️ Architecture
 
