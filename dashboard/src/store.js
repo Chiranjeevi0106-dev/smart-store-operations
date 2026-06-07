@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://smart-store-api-bzz2.onrender.com'
 
 const INITIAL_STORES = [
   { store_id: 'IND-BGR-082', store_name: 'Reliance Fresh - Indiranagar' },
