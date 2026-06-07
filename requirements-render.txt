@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.8.0
+motor
+pymongo
+python-dotenv
+requests
+httpx
+numpy
+pandas
+PyJWT
+cryptography
