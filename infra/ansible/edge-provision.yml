@@ -1,0 +1,377 @@
+---
+# Smart Store Operations — Ansible Playbook for Edge Node Provisioning
+# Phase 3: Network & Edge Infrastructure
+#
+# Provisions Jetson Orin NX edge nodes with:
+# - OS hardening, Docker runtime
+# - Auto-update, TLS 1.3 certificate rotation
+# - Service deployment (CV inference, queue, LP)
+
+- name: Provision Smart Store Edge Nodes
+  hosts: edge_nodes
+  become: true
+  vars:
+    docker_version: "24.0"
+    node_exporter_version: "1.7.0"
+    mosquitto_version: "2.0"
+    tls_cert_dir: "/etc/smartstore/certs"
+    data_dir: "/var/lib/smartstore"
+    log_dir: "/var/log/smartstore"
+    store_id: "{{ inventory_hostname | regex_replace('edge-', 'STORE-') }}"
+
+  tasks:
+    # ─── OS Hardening ──────────────────────────────────────────────
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+
+    - name: Install essential packages
+      apt:
+        name:
+          - curl
+          - wget
+          - gnupg
+          - ca-certificates
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+          - ntp
+          - htop
+          - jq
+          - sqlite3
+          - python3-pip
+        state: present
+
+    - name: Configure automatic security updates
+      copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        content: |
+          Unattended-Upgrade::Allowed-Origins {
+            "${distro_id}:${distro_codename}-security";
+          };
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          Unattended-Upgrade::Automatic-Reboot "false";
+
+    - name: Configure firewall (UFW)
+      block:
+        - ufw:
+            rule: allow
+            port: "22"
+            proto: tcp
+        - ufw:
+            rule: allow
+            port: "8001"
+            proto: tcp
+            comment: "CV inference API"
+        - ufw:
+            rule: allow
+            port: "1883"
+            proto: tcp
+            comment: "MQTT"
+        - ufw:
+            rule: allow
+            port: "9100"
+            proto: tcp
+            comment: "Prometheus node exporter"
+        - ufw:
+            state: enabled
+            default: deny
+            direction: incoming
+
+    - name: Configure fail2ban
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [sshd]
+          enabled = true
+          maxretry = 5
+          bantime = 3600
+
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^PermitRootLogin"
+        line: "PermitRootLogin no"
+      notify: restart sshd
+
+    - name: Set file limits
+      copy:
+        dest: /etc/security/limits.d/smartstore.conf
+        content: |
+          * soft nofile 65535
+          * hard nofile 65535
+          * soft nproc 32768
+          * hard nproc 32768
+
+    # ─── Docker Runtime ────────────────────────────────────────────
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Configure Docker daemon
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "50m",
+              "max-file": "3"
+            },
+            "default-runtime": "nvidia",
+            "runtimes": {
+              "nvidia": {
+                "path": "nvidia-container-runtime",
+                "runtimeArgs": []
+              }
+            },
+            "storage-driver": "overlay2",
+            "live-restore": true
+          }
+      notify: restart docker
+
+    - name: Enable Docker service
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    # ─── TLS Certificate Setup ─────────────────────────────────────
+    - name: Create TLS certificate directory
+      file:
+        path: "{{ tls_cert_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Generate self-signed TLS certificate (initial)
+      command: >
+        openssl req -x509 -newkey rsa:4096
+        -keyout {{ tls_cert_dir }}/edge.key
+        -out {{ tls_cert_dir }}/edge.crt
+        -days 365 -nodes
+        -subj "/CN={{ inventory_hostname }}/O=SmartStore/C=IN"
+      args:
+        creates: "{{ tls_cert_dir }}/edge.crt"
+
+    - name: Configure TLS certificate rotation cron
+      cron:
+        name: "TLS cert rotation check"
+        minute: "0"
+        hour: "3"
+        job: "/usr/local/bin/smartstore-cert-rotate.sh"
+
+    - name: Create certificate rotation script
+      copy:
+        dest: /usr/local/bin/smartstore-cert-rotate.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          CERT="{{ tls_cert_dir }}/edge.crt"
+          EXPIRY=$(openssl x509 -enddate -noout -in "$CERT" | cut -d= -f2)
+          EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s)
+          NOW_EPOCH=$(date +%s)
+          DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+          if [ "$DAYS_LEFT" -lt 30 ]; then
+            echo "Certificate expires in $DAYS_LEFT days. Rotating..."
+            openssl req -x509 -newkey rsa:4096 \
+              -keyout {{ tls_cert_dir }}/edge.key \
+              -out {{ tls_cert_dir }}/edge.crt \
+              -days 365 -nodes \
+              -subj "/CN={{ inventory_hostname }}/O=SmartStore/C=IN"
+            systemctl restart smartstore-inference
+            echo "Certificate rotated successfully."
+          fi
+
+    # ─── Directory Structure ───────────────────────────────────────
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ data_dir }}"
+        - "{{ data_dir }}/models"
+        - "{{ data_dir }}/buffer"
+        - "{{ data_dir }}/video_clips"
+        - "{{ log_dir }}"
+        - "/opt/smartstore"
+
+    # ─── Offline Buffer (SQLite) ───────────────────────────────────
+    - name: Create offline buffer database
+      copy:
+        dest: /opt/smartstore/init_buffer.sql
+        content: |
+          CREATE TABLE IF NOT EXISTS event_buffer (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            store_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            synced BOOLEAN DEFAULT FALSE,
+            synced_at TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_buffer_unsynced
+            ON event_buffer (synced, created_at);
+
+    - name: Initialize SQLite buffer
+      command: "sqlite3 {{ data_dir }}/buffer/event_buffer.db < /opt/smartstore/init_buffer.sql"
+      args:
+        creates: "{{ data_dir }}/buffer/event_buffer.db"
+
+    # ─── Mosquitto MQTT Broker ─────────────────────────────────────
+    - name: Install Mosquitto MQTT
+      apt:
+        name: mosquitto
+        state: present
+
+    - name: Configure Mosquitto
+      copy:
+        dest: /etc/mosquitto/conf.d/smartstore.conf
+        content: |
+          listener 1883
+          protocol mqtt
+          allow_anonymous true
+          max_queued_messages 10000
+          persistence true
+          persistence_location /var/lib/mosquitto/
+
+          # TLS listener
+          listener 8883
+          certfile {{ tls_cert_dir }}/edge.crt
+          keyfile {{ tls_cert_dir }}/edge.key
+          tls_version tlsv1.3
+      notify: restart mosquitto
+
+    # ─── Prometheus Node Exporter ──────────────────────────────────
+    - name: Download node exporter
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-arm64.tar.gz"
+        dest: /tmp/node_exporter.tar.gz
+
+    - name: Extract node exporter
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /usr/local/bin/
+        remote_src: yes
+        extra_opts: ["--strip-components=1"]
+        creates: /usr/local/bin/node_exporter
+
+    - name: Create node exporter service
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart node_exporter
+
+    # ─── Watchdog Service ──────────────────────────────────────────
+    - name: Create watchdog script
+      copy:
+        dest: /usr/local/bin/smartstore-watchdog.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Watchdog: restart inference container if unresponsive
+          HEALTH_URL="http://localhost:8001/health"
+          MAX_FAILURES=3
+          FAILURE_COUNT=0
+
+          while true; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$HEALTH_URL" 2>/dev/null)
+
+            if [ "$RESPONSE" != "200" ]; then
+              FAILURE_COUNT=$((FAILURE_COUNT + 1))
+              echo "$(date) Health check failed ($FAILURE_COUNT/$MAX_FAILURES)"
+
+              if [ "$FAILURE_COUNT" -ge "$MAX_FAILURES" ]; then
+                echo "$(date) Restarting inference container..."
+                docker restart smartstore-inference || true
+                FAILURE_COUNT=0
+              fi
+            else
+              FAILURE_COUNT=0
+            fi
+
+            sleep 10
+          done
+
+    - name: Create watchdog service
+      copy:
+        dest: /etc/systemd/system/smartstore-watchdog.service
+        content: |
+          [Unit]
+          Description=Smart Store Inference Watchdog
+          After=docker.service
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/smartstore-watchdog.sh
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable all services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      loop:
+        - mosquitto
+        - node_exporter
+        - smartstore-watchdog
+
+  # ─── Handlers ──────────────────────────────────────────────────
+  handlers:
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+    - name: restart mosquitto
+      systemd:
+        name: mosquitto
+        state: restarted
+
+    - name: restart node_exporter
+      systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: yes
